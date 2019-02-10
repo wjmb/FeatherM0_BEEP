@@ -8,7 +8,6 @@
  *
 **/
 
-#include <hal/hal.h>          // https://github.com/matthijskooijman/arduino-lmic
 #include <SPI.h>              // https://www.arduino.cc/en/Reference/SPI
 #include <I2S.h>              // https://www.arduino.cc/en/Reference/I2S .. part of "Adafruit SAMD Boards"
 
