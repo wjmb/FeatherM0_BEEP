@@ -43,12 +43,16 @@ void get_audiodata()
     Serial.println("Failed to initialize I2S!");
     while (1); // do nothing
   }
+  Serial.println("begin()");
   I2S.read(); // apparently this get things going.
   delay(800); // For startup/softunmute, this seems a safe minimal amount of time (at 12500 Hz sample rate)
   int16_t data[DATA_SIZE];
   for (int j=0; j<DATA_SIZE/64; j++) get_audiosample(&data[j*64]); // collect data .. 64 values at the time.
   //for (int j=0; j<DATA_SIZE; j++) Serial.println(data[j]);
+  Serial.println("Before end()");
   I2S.end();  // TODO: this is where is hangs the second time this function was called !!!
+  Serial.println("After end()");
+  Serial.flush();
 }
 
 void blink(int speed)
