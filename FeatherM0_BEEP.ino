@@ -24,8 +24,9 @@
 #include <SPI.h>              // https://www.arduino.cc/en/Reference/SPI
 #include <Adafruit_Sensor.h>  // https://github.com/adafruit/Adafruit_Sensor
 #include <Adafruit_BME280.h>  // https://github.com/adafruit/Adafruit_BME280_Library
-#include <I2S.h>              // https://www.arduino.cc/en/Reference/I2S .. part of "Adafruit SAMD Boards"
 #include <Adafruit_ZeroFFT.h> // https://github.com/adafruit/Adafruit_ZeroFFT
+#include <Adafruit_ZeroI2S.h> // https://github.com/adafruit/Adafruit_ZeroI2S
+#include <math.h>
 #include "ttn_credentials.h"  // this is where the APPEUI, DEVEUI and APPKEY are defined
 
 // Pin mapping
@@ -42,22 +43,23 @@ const lmic_pinmap lmic_pins = {
 // ttn_credentials.h contains APPEUI, DEVEUI and APPKEY; makes it easier to share code without sharing credentials
 void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
 void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
-void os_getDevKey (u1_t* buf) {  memcpy_P(buf, APPKEY, 16);}
+void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
 
 static osjob_t sendjob;
 
 // Schedule TX every this many seconds (might become longer due to duty cycle limitations).
 // TTN fair use policy: 30 seconds per day airtime.
-const unsigned TX_INTERVAL = 600;
+const unsigned TX_INTERVAL = 150;
+const unsigned TX_PER_REJOIN = 24*3600/TX_INTERVAL;
 
 // Samplerate must be a multiple of (MasterClock/64). For SAMD21, 48MHz/samplerate must 
-// therefore be a multiple of 64. For ICS43432, 7.19 kHz is the min freq value f_ws (see datasheet). 
-// So, options are: 7500 (14.65), 9375 (18.31), 10000 (19.53), 12500 (24.41), 15000 (29.30), 
-// 15625 (30.52), etc. (with between parenthesis the binwidht if datasize=512)
+// therefore be a multiple of 64. 
 #define SAMPLE_RATE 12500 // max freq detectable is half of this according to Nyquist
 #define DATA_SIZE 1024 // needs to be a multiple of 64.
 #define SPECTRUM_SIZE (DATA_SIZE/2) // half of DATA_SIZE.
-uint8_t NR_OF_SPECTRA = 8; // nr of freq. spectra to add and get a less discretised spectrum
+uint8_t NR_OF_SPECTRA = 1; // nr of freq. spectra to add and get a less discretised spectrum
+
+// for condensing the spectrum into a course spectrum to be broadcast over LoRa
 #define NR_OF_BINS_TO_COMBINE 4 // nr of bins to combine to get a course spectrum.
 #define STARTBIN 8 // 98 Hz lower frequency of the relevant freq window
 #define ENDBIN 48 // 586 Hz upper frequency of the relevant freq window
@@ -66,9 +68,11 @@ uint8_t NR_OF_SPECTRA = 8; // nr of freq. spectra to add and get a less discreti
 // BME280 over i2c
 Adafruit_BME280 bme; // I2C
 
-// I2S variables.
-uint32_t I2Sbuffer[512];
-volatile int I2Savailable = 0;
+/* create a buffer for both the left and right channel data */
+int32_t left[DATA_SIZE];
+int32_t right[DATA_SIZE];
+
+Adafruit_ZeroI2S i2s(0, 1, 9, 2);
 
 // sensor data (not all used yet)
 int16_t t = 0; // temperature (degrC*100)
@@ -103,7 +107,7 @@ void onEvent (ev_t ev)
             Serial.println(F("EV_JOINED"));
             // Disable link check validation (automatically enabled
             // during join, but not supported by TTN at this time).
-            LMIC_setLinkCheckMode(0);
+            // LMIC_setLinkCheckMode(0);
             // after join succeeded, we can start sending.
             do_send(&sendjob);
             break;
@@ -128,6 +132,11 @@ void onEvent (ev_t ev)
               // so we take the first byte and use as a kind of gain parameter.
               NR_OF_SPECTRA = downlink[0];
               Serial.print(F(" NR_OF_SPECTRA set to: ")); Serial.println(NR_OF_SPECTRA);
+            }
+            if (LMIC.seqnoUp>TX_PER_REJOIN) {
+              Serial.println(F(" Resetting and rejoining "));
+              LMIC_reset();
+              LMIC_startJoining();
             }
             // Schedule next transmission
             os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
@@ -183,68 +192,65 @@ void get_weight()
 {
 }
 
-void onI2SReceive() 
-{
-  // This function will run at a frequency of (sampleRate / 64). At 3.125khz, this is every 20 ms
-  // so make sure this is called again within that time if a contiguous set of data is needed.
-  I2S.read(I2Sbuffer, 512);
-  I2Savailable = 1;
-}
-
-void get_audiosample(int16_t *sampledata)
+void get_audiosample(int32_t *sampledata)
 {  
-  while (!I2Savailable); // wait until data is available again.
-  int *values = (int *) I2Sbuffer;
-  for (int i=0; i<64; i++) 
+  for (unsigned i=0; i<DATA_SIZE; ++i) i2s.read(&left[i], &right[i]);
+  for (int i = 0; i<DATA_SIZE; i++) 
   {
-    // If the SEL pin is low, samples will be in odd numbered positions.
-    // If you connect SEL to high, data will be in even positions.
-    // TODO: how much to shift the data? I guess 7 bits for the ICS43432
-    // 32 bits - 1 bit - 24 bits = 7 bit shift . Not sure though.
-    // For SPH0645LM4H-B, which doesn't skip the first bit, it will be:
-    // 32 bits - 18 bits = 14 bit shift.
-    sampledata[i] = values[(2*i) + 1] >> 14;
-    // TODO: use this bitshifting as a kind of noise reduction or gain parameter.
+    left[i] >>= 7;
+    right[i] >>= 7;
+    // FOR SOME REALLY ODD REASON, DATA COMES IN OCCASIONALLY ON THE LEFT AND OCCASIONALLY ON THE RIGHT CHANNEL.
+    // WORKAROUND! the other channel contains -1 or 0 (not sure why), so adding it gives only as small deviation. 
+    sampledata[i] = left[i]+right[i];
   }
-  I2Savailable = 0;
 }
 
 void get_audiodata()
 {
-  I2S.onReceive(onI2SReceive);
-  if (!I2S.begin(I2S_PHILIPS_MODE, SAMPLE_RATE, 32)) {
-    Serial.println("Failed to initialize I2S!");
-    while (1); // do nothing
-  }
-  I2S.read(); // apparently this get things going.
-  delay(800); // For startup/softunmute, this seems a safe minimal amount of time (at 12500 Hz sample rate)
-  int16_t data[DATA_SIZE]; // TODO: is there the risk of overflow, because the SPH0645LM4H-B / ICS43432 returns 18 / 24 bits?
-  uint16_t spctrm[SPECTRUM_SIZE]; 
-  // collect microphone input, determine RMS of raw data and do FFT. We simply take a number of spectra 
-  // and average these. Alternatives would be to calculate a moving average or exponential smoothing on the spectrum.
+  uint16_t spctrm[SPECTRUM_SIZE];
   memset(spctrm,0,sizeof(spctrm));
-  uint32_t rms = 0;
+  uint64_t ss = 0; // sum of squares, 24 bits squared is 48 bits range, so need >32 bits
+    
   for (int i=0; i<NR_OF_SPECTRA; i++) 
   {
-    // collect data .. 64 values at the time.
-    for (int j=0; j<DATA_SIZE/64; j++) get_audiosample(&data[j*64]);
-    for (int j=0; j<DATA_SIZE; j++) rms += data[j]*data[j];
-    //for (int j=0; j<DATA_SIZE; j++) Serial.println(data[j]);
-    // run the FFT
-    ZeroFFT(data, DATA_SIZE);
-    // add spectrum to array used to average a number of them. No need to divide by NR_OF_SPECTRA as uint16_t is large enough
-    for (int j=0; j<SPECTRUM_SIZE; j++) spctrm[j]+=data[j];
-  }
-  rms = sqrt(rms/(NR_OF_SPECTRA*DATA_SIZE));
-  // SPH0645LM4H-B: -26 dBFS Sensitivity and 65 dBA signal to noise (both at 94 dB SPL) 
-  // Therefore, full scale = 94 dB + 26 dB = 120 dB = FS
-  // SNR w.r.t. 94 dB reference -> 94 dB - 65 dBA = 29 dB noise floor (approx)
-  // FS = 2^17-1 = 131071 (if 18 bits signed is true).
-  // TODO: work this out for the ICS43432.
-  s_SPL = 100*(float)(20.0*log10(sqrt(2)*rms/131071)+120); // uncalibrated.
-  Serial.print(F("s_SPL (x100 dB)    : ")); Serial.println(s_SPL);
+    int32_t data[DATA_SIZE];
+    // sample microphone.
+    get_audiosample(data);
+    
+    // take out the DC component, calculate max ampl, and rms value.
+    int32_t mean = 0; // we sum 24 bits oscillating data 2^10 times, so max range is 34 bits. 32 bits is sufficient.
+    for (int j=0; j<DATA_SIZE; j++) mean += data[j];
+    mean/=DATA_SIZE;
+    
+    uint32_t mx = 0; // max value
+    for (int j=0; j<DATA_SIZE; j++) 
+    {
+      data[j] -= mean;
+      ss += data[j]*data[j]; 
+      if (abs(data[j])>mx) mx=abs(data[j]);
+    }
 
-  I2S.end();  // TODO: this is where is hangs sometimes !!!
+    // need to fit 24 bits into 16 bits for FFT, so we scale:
+    byte shift=0;
+    while (mx>((1UL<<15)-1)) 
+    {
+      shift++;
+      mx>>=1;
+    }
+    int16_t data16[DATA_SIZE];
+    for (int j=0; j<DATA_SIZE; j++) data16[j] = data[j]>>shift;
+    
+    ZeroFFT(data16, DATA_SIZE);
+
+    // WRONG: cannot just add spectra of different scaling factors! Guess, we could add them shifted back again???
+    for (int j=0; j<SPECTRUM_SIZE; j++) spctrm[j]+=data16[j]; // potential overflow, I guess, we could devide by NR_OF_SPECTRA.
+  }
+  
+  uint32_t rms = sqrt(ss/DATA_SIZE);
+  const int FULL_SCALE_DBSPL = 120; // FULL SCALE dBSPL (AOP = 116dB SPL)
+  const double FULL_SCALE_DBFS = 20*log10(pow(2,23)); // BIT LENGTH = 24 for ICS43432 ... or should this be 23 (half range)
+  s_SPL = 100*(FULL_SCALE_DBSPL-(FULL_SCALE_DBFS-20*log10(sqrt(2) * rms)));
+  Serial.print(F("s_SPL (x100 dB)    : ")); Serial.println(s_SPL);
 
   // Make a condensed and normalised version of the relevant part of spectrum [STARTBIN,ENDBIN).
   uint32_t cspctrm[NR_OF_COURSE_BINS]; // course spectrum (q15_t overflows)
@@ -279,37 +285,32 @@ int FreeRam ()
   return &stack_dummy - sbrk(0);
 }
 
-void blink()
+void blink(uint16_t length)
 {
   digitalWrite(REDLED, HIGH);
-  delay(200);
+  delay(length);
   digitalWrite(REDLED, LOW);
-  delay(200);
+  delay(length);
 }
 
 void do_send(osjob_t* j)
 {
+  Serial.print(F("seqnoUp            : ")); Serial.println(LMIC.seqnoUp);
   // Read sensor values
-  get_battery();
+  //get_battery();
   get_temperature();
   get_audiodata();
-
   // prepare data to be sent
-  byte mydata[9+NR_OF_COURSE_BINS];
+  byte mydata[7+NR_OF_COURSE_BINS];
   mydata[0] = t_i >> 8;
   mydata[1] = t_i;
   mydata[2] = p >> 8;
   mydata[3] = p;
   mydata[4] = h;
-  mydata[5] = bv >> 8;
-  mydata[6] = bv;
-  mydata[7] = s_SPL >> 8;
-  mydata[8] = s_SPL;
-  for (unsigned i=0;i<NR_OF_COURSE_BINS;i++)
-  {
-    mydata[8+i] = spectrum[i];
-  }
-     
+  mydata[5] = s_SPL >> 8;
+  mydata[6] = s_SPL;
+  for (unsigned i=0;i<NR_OF_COURSE_BINS;i++) mydata[7+i] = spectrum[i];
+    
   // Check if there is not a current TX/RX job running
   if (LMIC.opmode & OP_TXRXPEND) {
       Serial.println(F("OP_TXRXPEND, not sending"));
@@ -327,7 +328,7 @@ void setup()
   
   pinMode(REDLED, OUTPUT);
   
-  Serial.begin(9600);
+  Serial.begin(115200);
   Serial.println(F("Starting"));
   
   // start temperature sensor.
@@ -338,7 +339,11 @@ void setup()
   if (!bme_status) {
         Serial.println("Could not find a valid BME280 sensor");
   }
-    
+
+  // start I2S with 32-bits per sample, as needed by SPH0645LM4H-B and ICS43432.
+  i2s.begin(I2S_32_BIT, SAMPLE_RATE);
+  i2s.enableRx();
+  
   // LMIC init
   os_init();
   // Reset the MAC state. Session and pending data transfers will be discarded.
@@ -347,14 +352,11 @@ void setup()
   LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
   // join
   LMIC_startJoining();
-  blink(); blink(); blink();
+  blink(200); blink(200); blink(400);
   // Some test today show that using the following will NOT make TTN send ADR:
   LMIC_setAdrMode(1);
   // Does TTN support LinkCheckMode?
   LMIC_setLinkCheckMode(1);
-  
-  // Set data rate and transmit power
-  //LMIC_setDrTxpow(DR_SF12, 21);
 }
 
 void loop() 
